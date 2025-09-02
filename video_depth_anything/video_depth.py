@@ -1,16 +1,16 @@
-# Copyright (2025) Bytedance Ltd. and/or its affiliates
+# Copyright (2025) Bytedance Ltd. and/or its affiliates 
 
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License"); 
+# you may not use this file except in compliance with the License. 
+# You may obtain a copy of the License at 
 
-#     http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0 
 
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Unless required by applicable law or agreed to in writing, software 
+# distributed under the License is distributed on an "AS IS" BASIS, 
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
+# See the License for the specific language governing permissions and 
+# limitations under the License. 
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -24,7 +24,8 @@ from .dinov2 import DINOv2
 from .dpt_temporal import DPTHeadTemporal
 from .util.transform import Resize, NormalizeImage, PrepareForNet
 
-from utils.util import compute_scale_and_shift, get_interpolate_frames
+# from .util.util_func import compute_scale_and_shift, get_interpolate_frames
+from ..utils.util import compute_scale_and_shift, get_interpolate_frames
 
 # infer settings, do not change
 INFER_LEN = 32
@@ -49,7 +50,7 @@ class VideoDepthAnything(nn.Module):
             'vits': [2, 5, 8, 11],
             'vitl': [4, 11, 17, 23]
         }
-
+        
         self.encoder = encoder
         self.pretrained = DINOv2(model_name=encoder)
 
@@ -59,12 +60,14 @@ class VideoDepthAnything(nn.Module):
         B, T, C, H, W = x.shape
         patch_h, patch_w = H // 14, W // 14
         features = self.pretrained.get_intermediate_layers(x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True)
-        depth = self.head(features, patch_h, patch_w, T)[0]
+        depth = self.head(features, patch_h, patch_w, T)
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
         return depth.squeeze(1).unflatten(0, (B, T)) # return shape [B, T, H, W]
 
     def infer_video_depth(self, frames, target_fps, input_size=518, device='cuda', fp32=False):
+        if frames.max() < 2.0:
+            frames = frames * 255.0
         frame_height, frame_width = frames[0].shape[:2]
         ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
         if ratio > 1.78:  # we recommend to process video with ratio smaller than 16:9 due to memory limitation
@@ -79,7 +82,7 @@ class VideoDepthAnything(nn.Module):
                 keep_aspect_ratio=True,
                 ensure_multiple_of=14,
                 resize_method='lower_bound',
-                image_interpolation_method=cv2.INTER_CUBIC,
+                # image_interpolation_method=cv2.INTER_CUBIC,
             ),
             NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             PrepareForNet(),
@@ -88,15 +91,26 @@ class VideoDepthAnything(nn.Module):
         frame_list = [frames[i] for i in range(frames.shape[0])]
         frame_step = INFER_LEN - OVERLAP
         org_video_len = len(frame_list)
+        
         append_frame_len = (frame_step - (org_video_len % frame_step)) % frame_step + (INFER_LEN - frame_step)
-        frame_list = frame_list + [frame_list[-1].copy()] * append_frame_len
-
+        frame_list = frame_list + [frame_list[-1].clone()] * append_frame_len
+        
         depth_list = []
         pre_input = None
-        for frame_id in tqdm(range(0, org_video_len, frame_step)):
+        for frame_id in range(0, org_video_len, frame_step):
             cur_list = []
             for i in range(INFER_LEN):
-                cur_list.append(torch.from_numpy(transform({'image': frame_list[frame_id+i].astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0))
+        
+                img_data = frame_list[frame_id+i].to(torch.float32) / 255.0
+                transformed = transform({'image': img_data})['image']
+                
+                if not isinstance(transformed, torch.Tensor):
+                    cur_tensor = torch.from_numpy(transformed).unsqueeze(0).unsqueeze(0)
+                else:
+                    cur_tensor = transformed.unsqueeze(0).unsqueeze(0)
+                    
+                cur_list.append(cur_tensor)
+                
             cur_input = torch.cat(cur_list, dim=1).to(device)
             if pre_input is not None:
                 cur_input[:, :OVERLAP, ...] = pre_input[:, KEYFRAMES, ...]
@@ -128,29 +142,47 @@ class VideoDepthAnything(nn.Module):
                 curr_align = []
                 for i in range(len(kf_align_list)):
                     curr_align.append(depth_list[frame_id+i])
-                scale, shift = compute_scale_and_shift(np.concatenate(curr_align),
-                                                       np.concatenate(ref_align),
-                                                       np.concatenate(np.ones_like(ref_align)==1))
+                curr_align_np = [t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t for t in curr_align]
+                ref_align_np = [t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t for t in ref_align]
+                
+                scale, shift = compute_scale_and_shift(np.concatenate(curr_align_np),
+                                                    np.concatenate(ref_align_np),
+                                                    np.concatenate(np.ones_like(ref_align_np)==1))
 
                 pre_depth_list = depth_list_aligned[-INTERP_LEN:]
                 post_depth_list = depth_list[frame_id+align_len:frame_id+OVERLAP]
                 for i in range(len(post_depth_list)):
                     post_depth_list[i] = post_depth_list[i] * scale + shift
-                    post_depth_list[i][post_depth_list[i]<0] = 0
+                    if isinstance(post_depth_list[i], torch.Tensor):
+                        post_depth_list[i] = torch.clamp(post_depth_list[i], min=0)
+                    else:
+                        post_depth_list[i][post_depth_list[i]<0] = 0
                 depth_list_aligned[-INTERP_LEN:] = get_interpolate_frames(pre_depth_list, post_depth_list)
 
                 for i in range(OVERLAP, INFER_LEN):
-                    new_depth = depth_list[frame_id+i] * scale + shift
-                    new_depth[new_depth<0] = 0
+                    if isinstance(depth_list[frame_id+i], torch.Tensor):
+                        new_depth = depth_list[frame_id+i] * scale + shift
+                        new_depth = torch.clamp(new_depth, min=0)
+                    else:
+                        new_depth = depth_list[frame_id+i] * scale + shift
+                        new_depth[new_depth<0] = 0
                     depth_list_aligned.append(new_depth)
 
                 ref_align = ref_align[:1]
                 for kf_id in kf_align_list[1:]:
-                    new_depth = depth_list[frame_id+kf_id] * scale + shift
-                    new_depth[new_depth<0] = 0
+                    if isinstance(depth_list[frame_id+kf_id], torch.Tensor):
+                        new_depth = depth_list[frame_id+kf_id] * scale + shift
+                        new_depth = torch.clamp(new_depth, min=0)
+                    else:
+                        new_depth = depth_list[frame_id+kf_id] * scale + shift
+                        new_depth[new_depth<0] = 0
                     ref_align.append(new_depth)
-
-        depth_list = depth_list_aligned
-
-        return np.stack(depth_list[:org_video_len], axis=0), target_fps
-
+                    
+        if all(isinstance(d, torch.Tensor) for d in depth_list_aligned[:org_video_len]):
+            result = torch.stack(depth_list_aligned[:org_video_len], dim=0)
+            return result, target_fps
+        else:
+            result = [torch.tensor(d) if not isinstance(d, torch.Tensor) else d 
+                    for d in depth_list_aligned[:org_video_len]]
+            result = torch.stack(result, dim=0)
+            return result, target_fps
